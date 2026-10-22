@@ -1,0 +1,1044 @@
+const test = require('node:test');
+const assert = require('node:assert');
+
+const {
+  needsRewrite,
+  buildOrderAttributes,
+  packDateTag,
+  cutoffFor,
+  toSlashDate,
+  locationFor,
+  timeRangeForWindow,
+  DEFAULT_DELIVERY_TIME,
+  isPostcodeShaped,
+  previousTuple,
+  SUPERSEDED_ATTRIBUTES,
+  scheduleFor,
+  locationCandidatesFor,
+  hasHdsRecords,
+  additiveOnly,
+  fillScope,
+  HDS_FIELDS,
+  pendingHdsFields,
+} = require('../src/lib/renewal-rewrite');
+const { mergeNoteAttributes, mergeTags } = require('../src/shopify');
+
+const attrs = (pairs) => ({
+  note_attributes: Object.entries(pairs).map(([name, value]) => ({ name, value })),
+});
+
+// --- cutoff derivation -------------------------------------------------------
+// HDS states the cutoff as a weekday ("Friday 11 PM"), not a date. Pairing it
+// with the delivery date yields both the cutoff date and the charge offset.
+// The expectations below were verified against both live regions.
+
+test('cutoffFor derives the NSW cutoff (Monday delivery, Friday cutoff = 3 days)', () => {
+  assert.deepStrictEqual(cutoffFor({ delivery_date: '2026-08-24', cutoff_info: 'Friday 11 PM' }), {
+    cutoff_date: '2026-08-21',
+    cutoff_day: 'Friday',
+    charge_offset_days: 3,
+  });
+});
+
+test('cutoffFor derives the VIC cutoff (Friday delivery, Monday cutoff = 4 days)', () => {
+  assert.deepStrictEqual(cutoffFor({ delivery_date: '2026-08-28', cutoff_info: 'Monday 11 PM' }), {
+    cutoff_date: '2026-08-24',
+    cutoff_day: 'Monday',
+    charge_offset_days: 4,
+  });
+});
+
+test('cutoffFor reproduces the values the checkout extension itself wrote', () => {
+  // Order 1137 carried cutoff 2026/08/07 and "3 Days" for a 2026/08/10 delivery.
+  const c = cutoffFor({ delivery_date: '2026-08-10', cutoff_info: 'Friday 11 PM' });
+  assert.strictEqual(c.cutoff_date, '2026-08-07');
+  assert.strictEqual(c.charge_offset_days, 3);
+});
+
+test('cutoffFor goes a full week back when the cutoff day is the delivery day', () => {
+  const c = cutoffFor({ delivery_date: '2026-08-24', cutoff_info: 'Monday 11 PM' });
+  assert.strictEqual(c.cutoff_date, '2026-08-17');
+  assert.strictEqual(c.charge_offset_days, 7);
+});
+
+test('cutoffFor returns nulls rather than guessing when cutoff_info is absent', () => {
+  assert.deepStrictEqual(cutoffFor({ delivery_date: '2026-08-24' }), {
+    cutoff_date: null,
+    cutoff_day: null,
+    charge_offset_days: null,
+  });
+});
+
+// --- staleness detection -----------------------------------------------------
+
+test('needsRewrite flags a delivery date earlier than the order date', () => {
+  const state = needsRewrite({
+    created_at: '2026-08-19T12:00:00+10:00',
+    ...attrs({ 'Delivery-Date': '2026/08/10' }),
+  });
+  assert.strictEqual(state.stale, true);
+  assert.match(state.reason, /2026-08-10 is before the order date 2026-08-19/);
+});
+
+test('needsRewrite leaves a delivery date on or after the order date alone', () => {
+  for (const value of ['2026/08/19', '2026/08/24']) {
+    const state = needsRewrite({
+      created_at: '2026-08-19T12:00:00Z',
+      ...attrs({ 'Delivery-Date': value }),
+    });
+    assert.strictEqual(state.stale, false, value + ' should not be stale');
+  }
+});
+
+test('needsRewrite flags an order carrying no delivery date at all', () => {
+  const state = needsRewrite({ created_at: '2026-08-19T12:00:00Z', note_attributes: [] });
+  assert.strictEqual(state.stale, true);
+});
+
+test('needsRewrite falls back to the labelled HDS key', () => {
+  const state = needsRewrite({
+    created_at: '2026-08-19T12:00:00Z',
+    ...attrs({ 'HDS Delivery Date': '2026/08/10' }),
+  });
+  assert.strictEqual(state.stale, true);
+});
+
+test('needsRewrite does not rewrite when there is no order date to compare', () => {
+  assert.strictEqual(needsRewrite(attrs({ 'Delivery-Date': '2026/08/10' })).stale, false);
+});
+
+// --- where the delivery weekday comes from -----------------------------------
+// Loop has no deliveryDay field. Its only record of a weekday is the
+// subscription's own Delivery-Date attribute.
+
+test('the subscription Delivery-Date outranks anything on the order', () => {
+  const order = {
+    created_at: '2026-08-21T09:46:00+10:00',
+    ...attrs({ 'Delivery-Date': '2026/08/17', 'HDS Delivery Day': 'Monday' }),
+  };
+  const schedule = scheduleFor(order, { 'Delivery-Date': '2026-07-26' }); // a Sunday
+
+  assert.strictEqual(schedule.deliveryDay, 'Sunday');
+  assert.match(schedule.derivedFrom, /Loop subscription Delivery-Date 2026-07-26/);
+});
+
+test('without subscription attributes it falls back to the order', () => {
+  const order = { created_at: '2026-08-21T09:46:00+10:00', ...attrs({ 'HDS Delivery Day': 'Monday' }) };
+  const schedule = scheduleFor(order, null);
+
+  assert.strictEqual(schedule.deliveryDay, 'Monday');
+  assert.match(schedule.derivedFrom, /order HDS Delivery Day/);
+});
+
+test('and then to the weekday of the order own delivery date', () => {
+  const order = { created_at: '2026-08-21T09:46:00+10:00', ...attrs({ 'Delivery-Date': '2026/08/17' }) };
+  const schedule = scheduleFor(order, null);
+
+  assert.strictEqual(schedule.deliveryDay, 'Monday');
+  assert.match(schedule.derivedFrom, /order Delivery-Date 2026-08-17/);
+});
+
+test('a subscription with no Delivery-Date does not mask the order value', () => {
+  const order = { created_at: '2026-08-21T09:46:00+10:00', ...attrs({ 'HDS Delivery Day': 'Friday' }) };
+  const schedule = scheduleFor(order, { 'Delivery-Time': '12:00 AM - 7:00 AM' });
+
+  assert.strictEqual(schedule.deliveryDay, 'Friday');
+});
+
+// --- attribute construction --------------------------------------------------
+
+const RESOLVED = {
+  delivery_date: '2026-08-24',
+  pack_date: '2026-08-23',
+  production_date: '2026-08-22',
+  region: 'NSW Sydney Metro',
+  suburb: 'PRAIRIEWOOD',
+  postcode: '2176',
+  schedule_id: 1,
+  delivery_day: 'Monday',
+  delivery_window: 'AM,Business Hours',
+  formatted_date: 'Monday 24 August 2026',
+  option: { delivery_date: '2026-08-24', cutoff_info: 'Friday 11 PM' },
+};
+
+test('buildOrderAttributes writes the downstream keys in yyyy/mm/dd', () => {
+  const a = buildOrderAttributes(RESOLVED);
+  assert.strictEqual(a['Delivery-Date'], '2026/08/24');
+  assert.strictEqual(a['Pick-Pack-Date'], '2026/08/23');
+  assert.strictEqual(a['HDS Production Date'], '2026/08/22');
+  assert.strictEqual(a['HDS Cutoff Date'], '2026/08/21');
+  assert.strictEqual(a['Charge Offset'], '3 Days');
+});
+
+test('buildOrderAttributes keeps the customer window when the schedule offers it', () => {
+  const kept = buildOrderAttributes(RESOLVED, { preferredWindow: 'Business Hours' });
+  assert.strictEqual(kept['HDS Delivery Window'], 'Business Hours');
+  assert.strictEqual(buildOrderAttributes(RESOLVED)['HDS Delivery Window'], 'AM');
+});
+
+test('buildOrderAttributes never writes the fields other systems own', () => {
+  // Delivery-Time is excluded here on purpose: unlike the rest of this list it
+  // IS ours to fill now (see the Delivery-Time mapping tests below) — just
+  // never to overwrite a value the order already carries.
+  const keys = Object.keys(buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }));
+  const owned = ['Delivery-Location-Id', 'Delivery-Slot-Id', 'Checkout-Method', '_amp_sc'];
+  for (const key of owned) {
+    assert.ok(!keys.includes(key), 'must not write ' + key);
+  }
+  assert.ok(!('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' })));
+});
+
+test('buildOrderAttributes omits keys it could not derive', () => {
+  const a = buildOrderAttributes({ ...RESOLVED, production_date: null, option: {} });
+  assert.ok(!('HDS Production Date' in a));
+  assert.ok(!('Charge Offset' in a));
+});
+
+// --- Delivery-Time mapping ---------------------------------------------------
+// HDS knows window NAMES, not clock ranges, so the range is configuration.
+
+const withWindowTimes = (json, fn) => {
+  const saved = process.env.DELIVERY_WINDOW_TIMES;
+  if (json === undefined) delete process.env.DELIVERY_WINDOW_TIMES;
+  else process.env.DELIVERY_WINDOW_TIMES = json;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.DELIVERY_WINDOW_TIMES;
+    else process.env.DELIVERY_WINDOW_TIMES = saved;
+  }
+};
+
+const WINDOW_TIMES = '{"AM":"12:00 AM - 7:00 AM","Business Hours":"8:00 AM - 6:00 PM"}';
+
+test('Delivery-Time defaults when no mapping is configured and the order has none', () => {
+  withWindowTimes(undefined, () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
+  });
+});
+
+test('Delivery-Time already on the order is left untouched when no mapping is configured', () => {
+  withWindowTimes(undefined, () => {
+    assert.ok(
+      !('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }))
+    );
+  });
+});
+
+test('Delivery-Time follows the chosen window when a mapping is configured', () => {
+  withWindowTimes(WINDOW_TIMES, () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
+    const other = buildOrderAttributes(RESOLVED, { preferredWindow: 'Business Hours' });
+    assert.strictEqual(other['Delivery-Time'], '8:00 AM - 6:00 PM');
+  });
+});
+
+test('timeRangeForWindow tolerates casing drift between schedule and config', () => {
+  withWindowTimes(WINDOW_TIMES, () => {
+    assert.strictEqual(timeRangeForWindow('am'), '12:00 AM - 7:00 AM');
+    assert.strictEqual(timeRangeForWindow('BUSINESS HOURS'), '8:00 AM - 6:00 PM');
+  });
+});
+
+test('an unmapped window defaults Delivery-Time rather than leaving it blank', () => {
+  withWindowTimes('{"Evening":"5:00 PM - 9:00 PM"}', () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
+  });
+});
+
+test('an unmapped window still leaves an existing Delivery-Time alone', () => {
+  withWindowTimes('{"Evening":"5:00 PM - 9:00 PM"}', () => {
+    assert.ok(
+      !('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }))
+    );
+  });
+});
+
+test('invalid DELIVERY_WINDOW_TIMES fails safe instead of throwing', () => {
+  withWindowTimes('{not json', () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
+  });
+});
+
+// --- orders scheduled by another app -----------------------------------------
+// Production orders come from Zapiet: a valid future Delivery-Date, a slot id, and
+// no HDS fields. The date is right, so only the HDS records need adding.
+
+test('an order with no HDS fields is detected as missing them', () => {
+  const zapietOrder = attrs({
+    'Delivery-Location-Id': '290879',
+    'Delivery-Date': '2026/09/06',
+    'Delivery-Time': '6:00 AM - 6:00 PM',
+    'Delivery-Slot-Id': '140419042',
+    'Checkout-Method': 'delivery',
+  });
+
+  assert.strictEqual(hasHdsRecords(zapietOrder), false);
+});
+
+test('any one of the HDS date fields counts as present', () => {
+  for (const key of ['HDS Ship Date', 'HDS Pack Date', 'HDS Production Date', 'Pick-Pack-Date']) {
+    assert.strictEqual(hasHdsRecords(attrs({ [key]: '2026/09/04' })), true, `${key} should count`);
+  }
+});
+
+test('HDS Region alone does not count — it carries no date', () => {
+  // Region without a pack date leaves the kitchen with nothing to work from.
+  assert.strictEqual(hasHdsRecords(attrs({ 'HDS Region': 'VIC Melbourne Metro' })), false);
+});
+
+test('an order with no attributes at all is missing its HDS records', () => {
+  assert.strictEqual(hasHdsRecords({ note_attributes: [] }), false);
+  assert.strictEqual(hasHdsRecords({}), false);
+});
+
+// --- additive writes ---------------------------------------------------------
+// On a store where other systems own the order, the fill must only ADD. A value
+// already on the order is never replaced, whatever we computed for it.
+
+test('a value already on the order is never replaced', () => {
+  const order = attrs({
+    'Delivery-Date': '2026/09/06',
+    'Delivery-Time': '6:00 AM - 6:00 PM',
+    'Delivery-Slot-Id': '140419042',
+  });
+
+  const kept = additiveOnly(order, {
+    'Delivery-Date': '2026/09/13', // we computed something different
+    'Delivery-Time': '12:00 AM - 7:00 AM',
+    'Pick-Pack-Date': '2026/09/04', // genuinely missing
+  });
+
+  assert.deepStrictEqual(kept, { 'Pick-Pack-Date': '2026/09/04' });
+});
+
+test('an empty existing value counts as missing and is filled', () => {
+  const order = attrs({ 'Pick-Pack-Date': '' });
+  assert.deepStrictEqual(additiveOnly(order, { 'Pick-Pack-Date': '2026/09/04' }), {
+    'Pick-Pack-Date': '2026/09/04',
+  });
+});
+
+test('an order with nothing on it takes everything offered', () => {
+  const kept = additiveOnly({ note_attributes: [] }, { 'Pick-Pack-Date': '2026/09/04', 'HDS Region': 'VIC' });
+  assert.strictEqual(Object.keys(kept).length, 2);
+});
+
+test('the fill scope defaults to every missing HDS field', () => {
+  const saved = process.env.FILL_HDS_ATTRIBUTES;
+  try {
+    // Adding every missing field is safe because the write is additive — nothing
+    // already on the order is replaced — so the default is the fuller one.
+    delete process.env.FILL_HDS_ATTRIBUTES;
+    assert.strictEqual(fillScope(), 'all-missing');
+
+    process.env.FILL_HDS_ATTRIBUTES = 'pack-date';
+    assert.strictEqual(fillScope(), 'pack-date');
+
+    process.env.FILL_HDS_ATTRIBUTES = 'everything';
+    assert.strictEqual(fillScope(), 'all-missing');
+  } finally {
+    if (saved === undefined) delete process.env.FILL_HDS_ATTRIBUTES;
+    else process.env.FILL_HDS_ATTRIBUTES = saved;
+  }
+});
+
+test('a complete order needs no HDS lookup, an incomplete one names what it needs', () => {
+  const complete = {};
+  for (const f of HDS_FIELDS) complete[f] = 'x';
+
+  assert.strictEqual(pendingHdsFields(attrs(complete)).length, 0, 'nothing pending');
+
+  const { 'HDS Region': _region, 'Charge Offset': _offset, ...partial } = complete;
+  assert.deepStrictEqual(pendingHdsFields(attrs(partial)), ['Charge Offset', 'HDS Region']);
+});
+
+// --- the key NetSuite reads --------------------------------------------------
+// NetSuite reads Pick-Pack-Date. It is the one attribute another system depends on
+// by name, so it must survive any future renaming of the HDS * set.
+
+test('Pick-Pack-Date is written whenever a pack date was resolved', () => {
+  const a = buildOrderAttributes(RESOLVED);
+
+  assert.strictEqual(a['Pick-Pack-Date'], '2026/08/23');
+  assert.strictEqual(a['Pick-Pack-Date'], a['HDS Ship Date'], 'both carry the same pack date');
+});
+
+test('Pick-Pack-Date is not silently dropped when other fields are missing', () => {
+  // A schedule with no cutoff info loses Charge Offset, but the pack date stands.
+  const a = buildOrderAttributes({ ...RESOLVED, option: {} });
+
+  assert.ok(!('Charge Offset' in a));
+  assert.strictEqual(a['Pick-Pack-Date'], '2026/08/23');
+});
+
+test('Pick-Pack-Date is omitted rather than blank when there is no pack date', () => {
+  // Better absent than an empty string: NetSuite reading "" is worse than reading
+  // nothing, and the held tag flags the order either way.
+  const a = buildOrderAttributes({ ...RESOLVED, pack_date: null });
+
+  assert.ok(!('Pick-Pack-Date' in a));
+  assert.ok(!('HDS Ship Date' in a));
+});
+
+test('the pack-pack tag matches the Pick-Pack-Date value', () => {
+  const a = buildOrderAttributes(RESOLVED);
+  const tag = packDateTag(RESOLVED.pack_date);
+
+  // 2026/08/23 -> Pick-Pack-Date-23-08-2026
+  const [y, m, d] = a['Pick-Pack-Date'].split('/');
+  assert.strictEqual(tag, `Pick-Pack-Date-${d}-${m}-${y}`);
+});
+
+// --- the HDS Ship Date rename ------------------------------------------------
+
+test('buildOrderAttributes writes HDS Ship Date, not HDS Pack Date', () => {
+  const a = buildOrderAttributes(RESOLVED);
+
+  assert.strictEqual(a['HDS Ship Date'], '2026/08/23');
+  assert.ok(!('HDS Pack Date' in a), 'the superseded label must not be written');
+  // Pick-Pack-Date is a separate downstream key and keeps its name.
+  assert.strictEqual(a['Pick-Pack-Date'], '2026/08/23');
+});
+
+test('the superseded label is listed for removal on rewrite', () => {
+  assert.ok(SUPERSEDED_ATTRIBUTES.includes('HDS Pack Date'));
+});
+
+test('a renamed key is dropped rather than left holding a stale value', () => {
+  const merged = mergeNoteAttributes(
+    [
+      { name: 'HDS Pack Date', value: '2026/08/09' },
+      { name: 'Delivery-Time', value: '12:00 AM - 7:00 AM' },
+    ],
+    { 'HDS Ship Date': '2026/08/23' },
+    SUPERSEDED_ATTRIBUTES
+  );
+
+  assert.deepStrictEqual(merged, [
+    { name: 'Delivery-Time', value: '12:00 AM - 7:00 AM' },
+    { name: 'HDS Ship Date', value: '2026/08/23' },
+  ]);
+});
+
+test('previousTuple reads either label, so older orders still work', () => {
+  const renamed = previousTuple(
+    attrs({ 'Delivery-Date': '2026/08/10', 'HDS Ship Date': '2026/08/09' })
+  );
+  const legacy = previousTuple(
+    attrs({ 'Delivery-Date': '2026/08/10', 'HDS Pack Date': '2026/08/09' })
+  );
+
+  assert.strictEqual(renamed.packGap, 1);
+  assert.strictEqual(legacy.packGap, 1);
+});
+
+// --- renewal cutoff ----------------------------------------------------------
+// For a renewal the cutoff IS the order date: Loop charges at the cutoff, so the
+// order existing means the cycle closed. Charge Offset stays the schedule's rule.
+
+test('a cutoff override wins over the schedule-derived cutoff', () => {
+  const a = buildOrderAttributes({
+    ...RESOLVED,
+    cutoff_override: { cutoff_date: '2026-08-19', cutoff_day: 'Wednesday', charge_offset_days: 3 },
+  });
+
+  assert.strictEqual(a['HDS Cutoff Date'], '2026/08/19');
+  assert.strictEqual(a['HDS Cutoff Day'], 'Wednesday');
+  // Still the schedule's offset, not delivery-minus-order-date (which would be 5)
+  // — that value is pushed to Loop to correct future charges.
+  assert.strictEqual(a['Charge Offset'], '3 Days');
+});
+
+test('packDateTag matches the tag format already on the orders', () => {
+  assert.strictEqual(packDateTag('2026-08-22'), 'Pick-Pack-Date-22-08-2026');
+  assert.strictEqual(packDateTag(null), null);
+});
+
+test('toSlashDate trims a timestamp to the date', () => {
+  assert.strictEqual(toSlashDate('2026-08-24T00:00:00Z'), '2026/08/24');
+});
+
+// --- location resolution -----------------------------------------------------
+
+test('locationFor ignores Delivery-Location-Id, which held a region name', () => {
+  const loc = locationFor({
+    shipping_address: { city: 'Prairiewood', zip: '2176' },
+    ...attrs({ 'Delivery-Location-Id': 'NSW Sydney Metro' }),
+  });
+  assert.deepStrictEqual(loc, { postcode: '2176', suburb: 'Prairiewood' });
+});
+
+test('locationFor accepts Delivery-Location-Id when it is postcode-shaped', () => {
+  // A real renewal carried Delivery-Location-Id "2170" and no HDS Postcode.
+  const loc = locationFor({
+    shipping_address: { city: 'Liverpool' },
+    ...attrs({ 'Delivery-Location-Id': '2170', 'Delivery-Location': 'WOM' }),
+  });
+  assert.deepStrictEqual(loc, { postcode: '2170', suburb: 'Liverpool' });
+});
+
+test('the shipping address still wins over Delivery-Location-Id', () => {
+  const loc = locationFor({
+    shipping_address: { city: 'Prairiewood', zip: '2176' },
+    ...attrs({ 'Delivery-Location-Id': '2170' }),
+  });
+  assert.strictEqual(loc.postcode, '2176');
+});
+
+test('isPostcodeShaped admits only four-digit values', () => {
+  for (const good of ['2170', '2176', ' 3977 ']) {
+    assert.ok(isPostcodeShaped(good), `${good} should be accepted`);
+  }
+  for (const bad of ['NSW Sydney Metro', '290881', '217', 'WOM', '', null, undefined]) {
+    assert.ok(!isPostcodeShaped(bad), `${bad} should be rejected`);
+  }
+});
+
+test('the shipping address is tried first — it is where the parcel goes', () => {
+  // On a renewal the labelled keys are a copy of the FIRST cycle, so a customer
+  // who has moved would otherwise be scheduled against the suburb they left.
+  const loc = locationFor({
+    shipping_address: { city: 'Geebung', zip: '4034' },
+    ...attrs({ 'HDS Postcode': '2170', 'HDS Suburb': 'PRESTONS' }),
+  });
+  assert.deepStrictEqual(loc, { postcode: '4034', suburb: 'Geebung' });
+});
+
+test('a moved customer yields both addresses, current one first', () => {
+  const candidates = locationCandidatesFor({
+    shipping_address: { city: 'Geebung', zip: '4034' },
+    ...attrs({ 'HDS Postcode': '2170', 'HDS Suburb': 'PRESTONS' }),
+  });
+
+  assert.strictEqual(candidates.length, 2);
+  assert.strictEqual(candidates[0].postcode, '4034');
+  assert.match(candidates[0].source, /shipping address/);
+  // The labelled pair stays as a fallback: it holds HDS's canonical spelling,
+  // which resolves when a free-text shipping city does not.
+  assert.strictEqual(candidates[1].postcode, '2170');
+});
+
+test('matching addresses are not looked up twice', () => {
+  const candidates = locationCandidatesFor({
+    shipping_address: { city: 'Prestons', zip: '2170' },
+    ...attrs({ 'HDS Postcode': '2170', 'HDS Suburb': 'PRESTONS' }),
+  });
+  assert.strictEqual(candidates.length, 1, 'case differs but the address is the same');
+});
+
+test('the labelled pair is used when there is no shipping address', () => {
+  const candidates = locationCandidatesFor(
+    attrs({ 'HDS Postcode': '2176', 'HDS Suburb': 'PRAIRIEWOOD' })
+  );
+  assert.strictEqual(candidates.length, 1);
+  assert.strictEqual(candidates[0].suburb, 'PRAIRIEWOOD');
+});
+
+// --- merge semantics ---------------------------------------------------------
+// The Admin API replaces note_attributes and tags wholesale, so both must merge.
+
+test('mergeNoteAttributes overwrites our keys and preserves the rest', () => {
+  const merged = mergeNoteAttributes(
+    [
+      { name: 'Delivery-Time', value: '12:00 AM - 7:00 AM' },
+      { name: 'Delivery-Date', value: '2026/08/10' },
+      { name: '_amp_sc', value: 'opaque' },
+    ],
+    { 'Delivery-Date': '2026/08/24', 'Pick-Pack-Date': '2026/08/23' }
+  );
+  assert.deepStrictEqual(merged, [
+    { name: 'Delivery-Time', value: '12:00 AM - 7:00 AM' },
+    { name: 'Delivery-Date', value: '2026/08/24' },
+    { name: '_amp_sc', value: 'opaque' },
+    { name: 'Pick-Pack-Date', value: '2026/08/23' },
+  ]);
+});
+
+test('mergeNoteAttributes skips empty values instead of blanking a field', () => {
+  const merged = mergeNoteAttributes([{ name: 'Delivery-Date', value: '2026/08/10' }], {
+    'Delivery-Date': null,
+    'HDS Region': '',
+  });
+  assert.deepStrictEqual(merged, [{ name: 'Delivery-Date', value: '2026/08/10' }]);
+});
+
+test('mergeTags replaces the superseded pick-pack tag and keeps the rest', () => {
+  const tags = mergeTags(
+    'Subscription, Pick-Pack-Date-09-08-2026, Deliver every 1 WEEK',
+    ['Pick-Pack-Date-23-08-2026'],
+    ['Pick-Pack-Date-']
+  );
+  assert.strictEqual(tags, 'Subscription, Deliver every 1 WEEK, Pick-Pack-Date-23-08-2026');
+});
+
+test('mergeTags does not duplicate a tag that is already present', () => {
+  assert.strictEqual(mergeTags('Subscription, VIP', ['vip']), 'Subscription, VIP');
+});
+
+// --- recomputing over a wrong value ------------------------------------------
+// The additive default protects what is on the order, which is exactly wrong when
+// the thing on the order is the mistake being corrected.
+
+const { fillHdsRecords, weekdayOf: weekdayOfDate } = require('../src/lib/renewal-rewrite');
+const { clearDeliveryOptionsCache } = require('../src/lib/renewal-date');
+
+const stubHds = (options) => async () => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    success: true,
+    region: { id: 7, name: 'VIC Melbourne Metro' },
+    suburb: { name: 'CARRUM', postcode: '3197' },
+    delivery_options: options,
+  }),
+});
+
+// Computed relative to whenever the suite actually runs, not a fixed 2026
+// literal: fillHdsRecords now rejects a derived pack date that is on or before
+// TODAY (see the staleness guard), so a fixture has to stay in the future
+// forever rather than merely at the time it was written.
+function minusDays(iso, days) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+function fridayAtLeastDaysAhead(days) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + days);
+  const FRIDAY = 5;
+  d.setUTCDate(d.getUTCDate() + ((FRIDAY - d.getUTCDay() + 7) % 7));
+  return d.toISOString().slice(0, 10);
+}
+const slash = (iso) => iso.replace(/-/g, '/');
+
+const FUTURE_FRIDAY = fridayAtLeastDaysAhead(60);
+const FUTURE_PACK = minusDays(FUTURE_FRIDAY, 2);
+const FUTURE_PRODUCTION = minusDays(FUTURE_FRIDAY, 3);
+
+const FRIDAY_SCHEDULE = [
+  {
+    schedule_id: 154,
+    delivery_day: 'Friday',
+    delivery_window: 'AM,Business Hours',
+    cutoff_info: 'Monday 11 PM',
+    delivery_date: FUTURE_FRIDAY,
+    pack_date: FUTURE_PACK,
+    production_date: FUTURE_PRODUCTION,
+  },
+];
+
+const HAND_ENTERED = {
+  id: 1,
+  created_at: '2026-09-03T22:50:00+10:00',
+  shipping_address: { city: 'Carrum', zip: '3197' },
+  // HDS Ship Date present too (not just Pick-Pack-Date) so this represents a
+  // fully hand-set, complete record — distinct from the genuinely incomplete
+  // case (only Pick-Pack-Date present) the pack-date-sync fix targets below.
+  ...attrs({ 'Delivery-Date': slash(FUTURE_FRIDAY), 'Pick-Pack-Date': '2026/09/05', 'HDS Ship Date': '2026/09/05' }),
+};
+
+test('overwrite replaces a pack date that was set by hand', async () => {
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(FRIDAY_SCHEDULE);
+  try {
+    const out = await fillHdsRecords(HAND_ENTERED, { dryRun: true, overwrite: true });
+
+    assert.equal(out.ok, true);
+    // The schedule's own two-day gap, not the 2026/09/05 that was there.
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(FUTURE_PACK));
+    // The delivery date it was computed around is unchanged.
+    assert.equal(out.attributes['Delivery-Date'], slash(FUTURE_FRIDAY));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('without overwrite the wrong pack date is left exactly as it was', async () => {
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(FRIDAY_SCHEDULE);
+  try {
+    const out = await fillHdsRecords(HAND_ENTERED, { dryRun: true });
+
+    assert.equal(out.ok, true);
+    assert.ok(
+      !('Pick-Pack-Date' in out.attributes),
+      'the existing value is protected, which is the default for a reason'
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('a still-future kept date is left alone (Delivery-Date untouched, additive)', async () => {
+  // The overwrite tests above exercise fillHdsRecords with overwrite:true; this
+  // confirms the ordinary additive path also leaves a good Delivery-Date as it
+  // is, since the staleness guard below changes that specifically when it fires.
+  const order = {
+    id: 4,
+    created_at: '2026-09-03T22:50:00+10:00',
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({ 'Delivery-Date': slash(FUTURE_FRIDAY) }),
+  };
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(FRIDAY_SCHEDULE);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true });
+    assert.equal(out.ok, true, out.reason);
+    assert.ok(!('Delivery-Date' in out.attributes), 'a still-valid kept date is not rewritten');
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(FUTURE_PACK));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+// --- pack-date staleness guard ------------------------------------------------
+// A kept Delivery-Date that has already gone by would derive a pack date that
+// has ALSO already gone by — useless to the kitchen. This is what happens when
+// fillHdsRecords reaches an order well after it arrived: a backfill, a delayed
+// retry, an old order surfaced from a spreadsheet days or weeks later.
+
+function daysFromNow(n) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+test('a kept date whose derived pack date has already passed is replaced with the next available one', async () => {
+  const staleDelivery = daysFromNow(-3);
+  const wanted = weekdayOfDate(staleDelivery);
+  const freshDelivery = daysFromNow(10);
+  const freshPack = daysFromNow(8);
+  const freshProduction = daysFromNow(7);
+
+  const schedule = [
+    {
+      schedule_id: 999,
+      delivery_day: wanted,
+      delivery_window: 'AM',
+      cutoff_info: 'Monday 11 PM',
+      delivery_date: freshDelivery,
+      pack_date: freshPack,
+      production_date: freshProduction,
+    },
+  ];
+
+  const order = {
+    id: 5,
+    created_at: `${daysFromNow(-10)}T09:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({ 'Delivery-Date': slash(staleDelivery) }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true });
+
+    assert.equal(out.ok, true, out.reason);
+    // Additive mode still corrects the stale kept date, or Pick-Pack-Date would
+    // describe a cycle Delivery-Date doesn't show.
+    assert.equal(out.attributes['Delivery-Date'], slash(freshDelivery));
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(freshPack));
+    assert.equal(out.resolved.production_date, freshProduction);
+    assert.match(out.resolved.matched_by, /already gone|next available/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('an order missing entirely by the time it is processed also gets the next available date', async () => {
+  // Same guard, exercised through --overwrite: a pack date typed in by hand
+  // that has since passed must not survive just because overwrite was asked for.
+  const staleDelivery = daysFromNow(-1);
+  const wanted = weekdayOfDate(staleDelivery);
+  const freshDelivery = daysFromNow(6);
+  const freshPack = daysFromNow(4);
+
+  const schedule = [
+    {
+      schedule_id: 1000,
+      delivery_day: wanted,
+      delivery_window: 'AM',
+      cutoff_info: 'Monday 11 PM',
+      delivery_date: freshDelivery,
+      pack_date: freshPack,
+      production_date: daysFromNow(3),
+    },
+  ];
+
+  const order = {
+    id: 6,
+    created_at: `${daysFromNow(-8)}T09:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({ 'Delivery-Date': slash(staleDelivery), 'Pick-Pack-Date': slash(daysFromNow(-3)) }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true, overwrite: true });
+
+    assert.equal(out.ok, true, out.reason);
+    assert.equal(out.attributes['Delivery-Date'], slash(freshDelivery));
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(freshPack));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('a stale kept date replaces the WHOLE HDS set, not just Delivery-Date, even additively', async () => {
+  // WM142311 in production: additive mode forced Delivery-Date through when it
+  // was stale, but left every OTHER field (HDS Ship Date, HDS Schedule ID, HDS
+  // Cutoff Date, HDS Region/Suburb/Postcode...) exactly as it was — because
+  // additiveOnly() saw those keys already had a (stale) value and protected
+  // them. The order ended up with a fresh Delivery-Date describing one cycle
+  // and a full set of "HDS *" fields still describing an old one — internally
+  // contradictory, and arguably worse than leaving it alone. Nothing here has
+  // --overwrite: this must self-correct in the ordinary additive path.
+  const staleDelivery = daysFromNow(-5);
+  const wanted = weekdayOfDate(staleDelivery);
+  const freshDelivery = daysFromNow(10);
+  const freshPack = daysFromNow(9);
+  const freshProduction = daysFromNow(8);
+
+  const schedule = [
+    {
+      schedule_id: 141,
+      delivery_day: wanted,
+      delivery_window: 'AM',
+      cutoff_info: 'Friday 11 PM',
+      delivery_date: freshDelivery,
+      pack_date: freshPack,
+      production_date: freshProduction,
+    },
+  ];
+
+  // Everything Loop copies verbatim from the subscription's frozen first cycle
+  // — internally consistent with ITSELF, but weeks stale as a group, exactly
+  // like the subscription attributes order:explain showed on WM142311.
+  const order = {
+    id: 7,
+    created_at: `${daysFromNow(-12)}T13:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    ...attrs({
+      'Delivery-Date': slash(staleDelivery),
+      'HDS Delivery Date': slash(daysFromNow(-20)),
+      'HDS Delivery Formatted': 'stale',
+      'HDS Delivery Day': wanted,
+      'HDS Delivery Window': 'AM',
+      'HDS Schedule ID': '999',
+      'HDS Cutoff Day': 'Old',
+      'HDS Cutoff Date': slash(daysFromNow(-23)),
+      'Charge Offset': '99 Days',
+      'HDS Ship Date': slash(daysFromNow(-21)),
+      'HDS Production Date': slash(daysFromNow(-22)),
+      'HDS Region': 'Old Region',
+      'HDS Suburb': 'OLD SUBURB',
+      'HDS Postcode': '0000',
+    }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    // No overwrite — the ordinary path every webhook/backfill run actually uses.
+    const out = await fillHdsRecords(order, { dryRun: true });
+
+    assert.equal(out.ok, true, out.reason);
+    assert.equal(out.attributes['Delivery-Date'], slash(freshDelivery));
+    assert.equal(out.attributes['Pick-Pack-Date'], slash(freshPack));
+    assert.equal(out.attributes['HDS Ship Date'], slash(freshPack));
+    assert.equal(out.attributes['HDS Production Date'], slash(freshProduction));
+    assert.equal(out.attributes['HDS Schedule ID'], 141);
+    assert.equal(out.attributes['HDS Region'], 'VIC Melbourne Metro');
+    assert.equal(out.attributes['HDS Suburb'], 'CARRUM');
+    assert.notEqual(out.attributes['HDS Cutoff Date'], slash(daysFromNow(-23)), 'the old cutoff must not survive');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Pick-Pack-Date and HDS Ship Date move together even when only one is missing', async () => {
+  // WM142754 in production: the order carried a stale Pick-Pack-Date (Loop's
+  // copy of the subscription's frozen first-cycle value) but no HDS Ship
+  // Date at all. additiveOnly() correctly filled the missing HDS Ship Date
+  // fresh (2026/09/16) but left Pick-Pack-Date exactly as stale as it was
+  // (2026/09/02) purely because it already had SOME value — two keys that
+  // are supposed to be the same fact then disagreed with each other. Not a
+  // stale-kept-date case (Delivery-Date itself is fine, future, not stale):
+  // this is the plain additive fill path every webhook run actually uses.
+  const futureDelivery = daysFromNow(4);
+  const wanted = weekdayOfDate(futureDelivery);
+  const freshPack = daysFromNow(2);
+  const freshProduction = daysFromNow(1);
+
+  const schedule = [
+    {
+      schedule_id: 178,
+      delivery_day: wanted,
+      delivery_window: 'Business Hours',
+      cutoff_info: 'Monday 11 PM',
+      delivery_date: futureDelivery,
+      pack_date: freshPack,
+      production_date: freshProduction,
+    },
+  ];
+
+  const order = {
+    id: 8,
+    created_at: `${daysFromNow(0)}T13:00:00+10:00`,
+    shipping_address: { city: 'Carrum', zip: '3197' },
+    // Only Pick-Pack-Date pre-exists (stale) — HDS Ship Date and everything
+    // else is genuinely missing, matching a fresh Loop renewal that copied
+    // just that one attribute from the subscription.
+    ...attrs({ 'Delivery-Date': slash(futureDelivery), 'Pick-Pack-Date': slash(daysFromNow(-12)) }),
+  };
+
+  const originalFetch = global.fetch;
+  clearDeliveryOptionsCache();
+  global.fetch = stubHds(schedule);
+  try {
+    const out = await fillHdsRecords(order, { dryRun: true }); // no --overwrite
+
+    assert.equal(out.ok, true, out.reason);
+    assert.equal(out.attributes['HDS Ship Date'], slash(freshPack));
+    assert.equal(
+      out.attributes['Pick-Pack-Date'],
+      slash(freshPack),
+      'Pick-Pack-Date must be corrected alongside HDS Ship Date, not left stale'
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+// --- the range follows the chosen window ------------------------------------
+// Delivery-Time holds the clock range and nothing else: "8:00 AM - 6:00 PM", the
+// form it has always had and the form whatever reads it downstream expects. What
+// the labelled config buys is that the RANGE tracks the window the customer
+// picked. The window's name is recorded alongside so anything that wants to name
+// it need not re-derive it from a pair of times, but it is never written into
+// Delivery-Time unless asked for explicitly.
+
+const LABELLED_WINDOWS = JSON.stringify({
+  AM: { label: 'Morning', time: '12:00 AM - 7:00 AM' },
+  'Business Hours': { label: 'Daytime', time: '8:00 AM - 6:00 PM' },
+});
+
+const withTimeFormat = (format, fn) => {
+  const saved = process.env.DELIVERY_TIME_FORMAT;
+  if (format === undefined) delete process.env.DELIVERY_TIME_FORMAT;
+  else process.env.DELIVERY_TIME_FORMAT = format;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.DELIVERY_TIME_FORMAT;
+    else process.env.DELIVERY_TIME_FORMAT = saved;
+  }
+};
+
+test('Delivery-Time is the range alone, and follows the chosen window', () => {
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    withTimeFormat(undefined, () => {
+      // No "Morning", no "Daytime" — just the numbers, as the order page shows.
+      assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
+
+      const daytime = buildOrderAttributes(RESOLVED, { preferredWindow: 'Business Hours' });
+      assert.strictEqual(daytime['Delivery-Time'], '8:00 AM - 6:00 PM');
+    });
+  });
+});
+
+test('a configured label never leaks into Delivery-Time by default', () => {
+  // The guard on the whole feature: the label exists in configuration, and an
+  // order carries a value other systems parse. One must not become the other by
+  // accident.
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    withTimeFormat(undefined, () => {
+      for (const window of ['AM', 'Business Hours']) {
+        const value = timeRangeForWindow(window);
+        assert.doesNotMatch(value, /Morning|Daytime/i, `${window} wrote "${value}"`);
+        assert.match(value, /^\d{1,2}:\d{2} [AP]M - \d{1,2}:\d{2} [AP]M$/, 'numbers only');
+      }
+    });
+  });
+});
+
+test('the plain string form still means the range alone', () => {
+  // Live configuration uses it, so it must keep working untouched.
+  withWindowTimes(WINDOW_TIMES, () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
+  });
+});
+
+test('the label can be opted into, and is off unless it is', () => {
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    withTimeFormat('{time}', () => {
+      assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], '12:00 AM - 7:00 AM');
+    });
+    withTimeFormat('{label} ({time})', () => {
+      assert.strictEqual(
+        buildOrderAttributes(RESOLVED)['Delivery-Time'],
+        'Morning (12:00 AM - 7:00 AM)'
+      );
+    });
+  });
+});
+
+test('either spelling of the two keys is accepted', () => {
+  // Hand-written JSON in an environment variable: rejecting a reasonable
+  // spelling would surface as an unmapped window, which says nothing useful.
+  withWindowTimes('{"AM":{"name":"Morning","range":"12:00 AM - 7:00 AM"}}', () => {
+    withTimeFormat(undefined, () => {
+      assert.strictEqual(timeRangeForWindow('AM'), '12:00 AM - 7:00 AM');
+    });
+    withTimeFormat('{label} {time}', () => {
+      assert.strictEqual(timeRangeForWindow('AM'), 'Morning 12:00 AM - 7:00 AM');
+    });
+  });
+});
+
+test('a labelled window tolerates the same casing drift as before', () => {
+  withWindowTimes(LABELLED_WINDOWS, () => {
+    withTimeFormat(undefined, () => {
+      assert.strictEqual(timeRangeForWindow('am'), '12:00 AM - 7:00 AM');
+      assert.strictEqual(timeRangeForWindow('BUSINESS HOURS'), '8:00 AM - 6:00 PM');
+    });
+  });
+});
+
+test('half a mapping is written rather than discarded', () => {
+  withWindowTimes('{"AM":{"label":"Morning"}}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), 'Morning');
+  });
+  withWindowTimes('{"AM":{"time":"12:00 AM - 7:00 AM"}}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), '12:00 AM - 7:00 AM');
+  });
+});
+
+test('an unusable mapping still leaves an existing Delivery-Time alone', () => {
+  // Writing an empty string would replace a correct customer-visible value with
+  // nothing, which is worse than leaving it as it was.
+  withWindowTimes('{"AM":{}}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), null);
+    assert.ok(
+      !('Delivery-Time' in buildOrderAttributes(RESOLVED, { existingDeliveryTime: '6:00 AM - 6:00 PM' }))
+    );
+  });
+  withWindowTimes('{"AM":42}', () => {
+    assert.strictEqual(timeRangeForWindow('AM'), null);
+  });
+});
+
+test('an unusable mapping still defaults Delivery-Time for an order with none', () => {
+  withWindowTimes('{"AM":{}}', () => {
+    assert.strictEqual(buildOrderAttributes(RESOLVED)['Delivery-Time'], DEFAULT_DELIVERY_TIME);
+  });
+});

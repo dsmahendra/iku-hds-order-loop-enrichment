@@ -1,0 +1,308 @@
+// The backstop: find recent orders missing their HDS data and fix them.
+//
+// Everything else in this service hangs off the webhook. That is one delivery
+// attempt for one order, and there are failure modes no amount of retrying
+// inside the handler can cover:
+//
+//   - Shopify never delivered the webhook (it retries a while, then gives up)
+//   - the HMAC did not verify, so the handler returned 401 and never ran
+//   - the process restarted mid-handling — a deploy during a Loop renewal run
+//   - the queue row was never written, so the retry job has nothing to find
+//
+// In every one of those the order simply has no pack date, and nothing in our own
+// tables says so. The retry job cannot help: it reads rows, and there is no row.
+//
+// So this asks Shopify instead. It walks the orders created in the last few hours
+// and, for any whose HDS data is incomplete, runs the same applyHdsToOrder the
+// webhook does. Independent of the webhook and of our queue, which makes it the
+// one check that can actually answer "does every order have a pack date".
+//
+// Deliberately cheap: deciding what needs work costs no API calls at all — both
+// planFor and the date tags are computed from the order payload already in hand —
+// so a quiet pass is one or two page reads and nothing else.
+
+const { listOrders, getOrder, getNoteAttribute } = require('../shopify');
+const { applyHdsToOrder, planFor } = require('../lib/apply-hds');
+const { HELD_TAG } = require('../lib/renewal-rewrite');
+const { missingTags, taggingEnabled } = require('../lib/order-tags');
+const { createDateWatch } = require('../lib/date-alerts');
+const audit = require('../lib/order-audit');
+
+// Remembers which orders have had their one check, and emails what it found.
+// SWEEP_CHECK_ONCE=false (set by the manual `packdates:sweep` script) uses a watch
+// that remembers nothing and sends nothing, so a hand run neither skips orders
+// nor uses up their scheduled check.
+const dateWatch = createDateWatch({
+  ephemeral: String(process.env.SWEEP_CHECK_ONCE || 'true').toLowerCase() === 'false',
+});
+
+const INTERVAL_MS = Number(process.env.SWEEP_INTERVAL_MS || 5 * 60 * 1000);
+const WINDOW_HOURS = Number(process.env.SWEEP_HOURS || 24);
+
+// An order created seconds ago is probably still in the webhook handler, and the
+// checkout extension may still be writing its own attributes onto it. Fixing it
+// here too would double every write and can lose to that second writer, so wait
+// until both have had their say. An order is checked ONCE, the first pass after
+// it is this old, and never again (see lib/date-alerts.js).
+const MIN_AGE_MINUTES = Number(process.env.SWEEP_MIN_AGE_MINUTES || 5);
+
+// Only orders created today (same rule as the other scripts' safety guard).
+// Anything older is left for a person to look at on purpose.
+const TODAY_ONLY = String(process.env.SWEEP_TODAY_ONLY || 'true').toLowerCase() !== 'false';
+
+// A bound on one pass. If something systemic broke and hundreds of orders need
+// fixing, repairing them over several passes is better than spending the whole
+// rate limit at once and starving the live webhooks. Raised alongside a shorter
+// interval (was 25/30min) so a renewal-burst-sized backlog clears within the
+// hour instead of still being there next morning.
+const MAX_FIXES = Number(process.env.SWEEP_MAX_FIXES || 50);
+
+let running = false;
+
+const isHeld = (order) =>
+  String(order?.tags || '')
+    .split(',')
+    .some((t) => t.trim() === HELD_TAG);
+
+// Why this order needs attention, or null if it does not. Makes no API calls.
+function needsWork(order) {
+  const plan = planFor(order);
+
+  if (plan.action === 'rewrite' || plan.action === 'fill') return { plan, why: plan.reason };
+  if (plan.action === 'hold') return null; // visible by its tag; not ours to force
+
+  // Dates are complete. The date tags derive from the order itself, so a missing
+  // one is detectable without asking Loop anything — and a missing date tag is
+  // the signature of a webhook that never ran.
+  if (taggingEnabled()) {
+    const missing = missingTags(order, null);
+    if (missing.length) return { plan, why: `missing tag(s) ${missing.join(', ')}` };
+  }
+
+  // Same reasoning for Delivery-Time: complete dates don't imply it was ever
+  // set, since HDS_FIELDS deliberately excludes it. applyHdsToOrder fills the
+  // default itself once it sees 'tags-only' — this only decides whether that
+  // call is worth making.
+  if (!getNoteAttribute(order, 'Delivery-Time')) {
+    return { plan, why: 'missing Delivery-Time' };
+  }
+  return null;
+}
+
+const packDateOf = (order) =>
+  getNoteAttribute(order, 'Pick-Pack-Date') ||
+  getNoteAttribute(order, 'HDS Ship Date') ||
+  getNoteAttribute(order, 'HDS Pack Date');
+
+// Best effort. The sweep's whole value is that it works without our tables, so a
+// DB problem must not stop it — it records the outcome only when it can, to save
+// the retry job repeating work already done.
+async function clearRetryFlag(orderId) {
+  if (!process.env.DATABASE_URL) return;
+  try {
+    const { pool } = require('../db');
+    await pool.query(
+      `UPDATE orders_to_enrich
+          SET hds_write_ok = TRUE, updated_at = NOW()
+        WHERE order_id = $1 AND hds_write_ok = FALSE`,
+      [orderId]
+    );
+  } catch {
+    // Nothing useful to do here, and the sweep itself already succeeded.
+  }
+}
+
+async function sweep() {
+  audit.setSource('sweep');
+  audit.prune(); // drop audit rows past AUDIT_RETENTION_DAYS; best effort
+  const now = Date.now();
+  const since = new Date(now - WINDOW_HOURS * 3600 * 1000).toISOString();
+  const newestAllowed = now - MIN_AGE_MINUTES * 60 * 1000;
+
+  let pageInfo = null;
+  let scanned = 0;
+  let tooNew = 0;
+  let held = 0;
+  let previousDay = 0;
+  let alreadyDone = 0;
+  const eligible = [];
+  const candidates = [];
+  const todayIso = new Date().toISOString().slice(0, 10);
+
+  do {
+    const res = await listOrders({
+      limit: 250,
+      pageInfo,
+      createdAtMin: pageInfo ? null : since,
+      fields: pageInfo
+        ? null
+        : 'id,name,created_at,tags,note_attributes,shipping_address,line_items',
+    });
+    pageInfo = res.pageInfo;
+    if (!res.orders.length) break;
+
+    for (const order of res.orders) {
+      scanned += 1;
+
+      if (new Date(order.created_at).getTime() > newestAllowed) {
+        tooNew += 1;
+        continue;
+      }
+      if (TODAY_ONLY && String(order.created_at || '').slice(0, 10) < todayIso) {
+        previousDay += 1;
+        continue;
+      }
+      if (isHeld(order)) {
+        held += 1;
+        continue;
+      }
+      eligible.push(order);
+    }
+  } while (pageInfo);
+
+  // Each order gets ONE check, the first pass it is old enough. Anything already
+  // checked is skipped outright: no judgement, no write, no email. A check that
+  // found nothing wrong counts too.
+  const checked = await dateWatch.alreadyChecked(eligible.map((o) => o.id));
+  for (const order of eligible) {
+    if (checked.has(String(order.id))) {
+      alreadyDone += 1;
+      continue;
+    }
+    const work = needsWork(order);
+    if (!work) {
+      dateWatch.begin(order); // healthy: recorded as checked, nothing to say
+      audit.recordCheck(order, 'ok — nothing to fix');
+      continue;
+    }
+    candidates.push({ order, ...work });
+  }
+
+  if (!candidates.length) {
+    await dateWatch.flush();
+    console.log(
+      `[sweep] ${scanned} order(s) in the last ${WINDOW_HOURS}h — all complete` +
+        (tooNew ? `, ${tooNew} too new to judge` : '') +
+        (held ? `, ${held} held` : '') +
+        (previousDay ? `, ${previousDay} from before today skipped` : '') +
+        (alreadyDone ? `, ${alreadyDone} already checked` : '')
+    );
+    return { scanned, fixed: 0, failed: 0, candidates: 0 };
+  }
+
+  console.warn(
+    `[sweep] ${candidates.length} of ${scanned} order(s) in the last ${WINDOW_HOURS}h are incomplete` +
+      (candidates.length > MAX_FIXES ? ` — fixing ${MAX_FIXES} this pass` : '')
+  );
+
+  let fixed = 0;
+  let failed = 0;
+
+  for (const { order: listed, why } of candidates.slice(0, MAX_FIXES)) {
+    const label = listed.name || listed.id;
+    try {
+      // Judge and write against the order as it is NOW, not as the list page saw
+      // it moments ago. Shopify replaces the whole attribute list on every write,
+      // so writing from a stale copy is how another writer's fields get erased.
+      // Also catches an order someone else completed since the scan.
+      const order = (await getOrder(listed.id))?.order || listed;
+      dateWatch.begin(order);
+      const stillNeeds = needsWork(order);
+      audit.recordCheck(order, stillNeeds ? `needs work — ${stillNeeds.why}` : 'ok — completed by something else', {
+        attempted_fix: Boolean(stillNeeds),
+      });
+      if (!stillNeeds) {
+        await clearRetryFlag(order.id);
+        continue;
+      }
+
+      // atCreation false: this runs long after the charge, so the subscription's
+      // completed count no longer describes this order and a billing-cycle tag
+      // taken from it would be wrong.
+      const out = await applyHdsToOrder(order, { atCreation: false });
+
+      if (!out.ok) {
+        failed += 1;
+        audit.record({ order, stage: 'backend_failed', detail: { reason: out.reason, action: out.action, was: why } });
+        // [ALERT]: one searchable tag across every job (this one, the retry
+        // job, a held renewal) so "is anything broken right now" is one log
+        // search rather than knowing each job's own prefix. Still logged here
+        // even if the next pass fixes it — this reflects the state RIGHT NOW.
+        console.warn(`[ALERT][sweep] ${label}: ${out.action} failed — ${out.reason} (was: ${why})`);
+        continue;
+      }
+
+      fixed += 1;
+      // What the order looks like after the write, for the one email about it.
+      try {
+        const fresh = (await getOrder(order.id))?.order;
+        if (fresh) dateWatch.finish(fresh);
+      } catch {
+        // The email then reports the order as it was before the fix.
+      }
+      const pack = out.wrote?.['Pick-Pack-Date'] || packDateOf(order) || null;
+      console.log(
+        `[sweep] ${label}: ${out.action} — ${why}` +
+          (pack ? `, pack ${pack}` : '') +
+          (out.tagsAdded.length ? `, tags ${out.tagsAdded.join(', ')}` : '')
+      );
+      await clearRetryFlag(order.id);
+    } catch (err) {
+      failed += 1;
+      const reason = (err.message || String(err)).split('\n')[0];
+      audit.record({ order: listed, stage: 'backend_failed', detail: { reason, was: why } });
+      console.warn(`[ALERT][sweep] ${label}: ${reason}`);
+
+      // Credentials or scopes fail identically for every remaining order, so stop
+      // rather than spend the rest of the pass rediscovering that.
+      if (/failed 40[13]|not set|no Admin API token/i.test(err.message || '')) {
+        console.error('[sweep] stopping this pass: the Admin API is not usable');
+        break;
+      }
+    }
+  }
+
+  await dateWatch.flush();
+
+  console.log(`[sweep] pass done: ${fixed} fixed, ${failed} failed.`);
+  return { scanned, fixed, failed, candidates: candidates.length };
+}
+
+async function tick() {
+  if (running) return; // a slow pass must not overlap the next
+  running = true;
+  try {
+    await sweep();
+  } catch (err) {
+    console.error('[sweep] pass failed:', err.message || err);
+  } finally {
+    running = false;
+  }
+}
+
+function initPackDateSweep() {
+  if (String(process.env.SWEEP_ENABLED || 'true').toLowerCase() === 'false') {
+    console.log('[sweep] disabled (SWEEP_ENABLED=false)');
+    return;
+  }
+
+  console.log(
+    `[sweep] started (every ${Math.round(INTERVAL_MS / 60000)}m over the last ${WINDOW_HOURS}h, ` +
+      `ignoring orders under ${MIN_AGE_MINUTES}m old, up to ${MAX_FIXES} fixes per pass)`
+  );
+
+  setInterval(tick, INTERVAL_MS);
+
+  // A first pass shortly after boot, not a full interval later. A deploy is
+  // exactly when someone is watching to see whether orders are being fixed, and
+  // making them wait half an hour to find out is the difference between a
+  // deployment they can verify and one they have to take on trust.
+  //
+  // Safe to run this early because the sweep ignores orders younger than
+  // MIN_AGE_MINUTES, so it cannot collide with the webhook backlog a restart
+  // delivers — those orders are all newer than that.
+  const firstPass = Number(process.env.SWEEP_FIRST_PASS_MS || 2 * 60 * 1000);
+  if (firstPass >= 0) setTimeout(tick, firstPass).unref?.();
+}
+
+module.exports = { initPackDateSweep, sweep, tick, needsWork };

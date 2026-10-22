@@ -1,0 +1,182 @@
+// Retry the orders whose HDS write did not land.
+//
+// The webhook gets one attempt. If it fails — HDS unreachable, a wrong
+// HDS_API_BASE, a Shopify write rejected, the suburb momentarily unserviceable —
+// nothing ever tried again, and that order simply had no pack date until someone
+// noticed and ran the backfill by hand. The enrichment queue does not cover this:
+// it fills our own tables, not the order in Shopify.
+//
+// So the rows the webhook could not complete are re-attempted here, on a slow
+// interval, with a bounded number of tries so a genuinely impossible order (a
+// suburb HDS does not serve) stops consuming API calls instead of being retried
+// forever.
+
+const { pool } = require('../db');
+const { getOrder } = require('../shopify');
+const { applyHdsToOrder } = require('../lib/apply-hds');
+const { notifyOrderStatus } = require('../lib/order-notify');
+const audit = require('../lib/order-audit');
+
+// Slow on purpose: this is a safety net, not the main path. The webhook handles
+// the normal case within a second of the order existing. But a Loop renewal
+// burst can leave more rows behind in one go than the old 10-per-15-minutes
+// pace could clear before the next burst arrived — which is what "still
+// missing pack dates by morning" looks like — so this trickle needs enough
+// throughput to actually drain a burst-sized backlog within the hour.
+const INTERVAL_MS = Number(process.env.HDS_RETRY_INTERVAL_MS || 5 * 60 * 1000);
+const BATCH = Number(process.env.HDS_RETRY_BATCH || 25);
+const MAX_ATTEMPTS = Number(process.env.HDS_RETRY_MAX_ATTEMPTS || 6);
+
+let running = false;
+
+// Rows the webhook left incomplete. 'skipped' covers a held order and one whose
+// rewrite failed; 'failed' covers an exhausted enrichment.
+//
+// hds_write_ok = FALSE is the case those two statuses missed entirely: the order
+// HAD a delivery date, so it was queued 'pending' and enriched normally, but the
+// write of the pack date onto the Shopify order did not land. Status alone could
+// not tell that apart from success, so nothing ever retried it.
+//
+// PRIORITIZE new orders (created < 10 minutes ago) first to catch transient
+// HDS outages quickly, then fall back to older orders. Fresh failures are more
+// likely to be fixable (HDS back online) than stale ones stuck on configuration.
+const SELECT_PENDING = `
+  SELECT order_id, status, attempts, error_message, hds_write_ok
+    FROM orders_to_enrich
+   WHERE (status IN ('skipped', 'failed') OR hds_write_ok = FALSE)
+     AND attempts < $1
+     AND created_at >= CURRENT_DATE
+   ORDER BY CASE
+              WHEN created_at >= NOW() - INTERVAL '10 minutes' THEN 0
+              ELSE 1
+            END,
+            created_at DESC
+   LIMIT $2
+`;
+
+async function retryOne(row) {
+  const orderId = row.order_id;
+
+  // Read the order fresh: it may have been corrected by hand since, in which case
+  // applyHdsToOrder finds nothing to do and the row is closed out.
+  const order = (await getOrder(orderId))?.order;
+  if (!order) throw new Error('order not found in Shopify');
+
+  // If hds_write_ok is TRUE, the webhook already successfully wrote attributes to Shopify.
+  // On retry, do a dry-run to check/fix, but don't re-write (avoids duplicate Shopify edits and losing data).
+  // If hds_write_ok is FALSE/NULL, the webhook write failed, so attempt to write again.
+  const skipShopifyWrite = row.hds_write_ok === true || row.hds_write_ok === 1;
+
+  audit.setSource('retry');
+  const out = await applyHdsToOrder(order, { atCreation: false, dryRun: skipShopifyWrite });
+
+  if (!out.ok) {
+    const attemptsMade = row.attempts + 1;
+    await pool.query(
+      `UPDATE orders_to_enrich
+          SET attempts = attempts + 1, error_message = $2, updated_at = NOW()
+        WHERE order_id = $1`,
+      [orderId, `retry: ${out.reason}`]
+    );
+
+    // The last attempt failing means nothing tries this order again on its
+    // own — a single searchable tag across every job (this one, the sweep, a
+    // held renewal) is what lets "is anything broken right now" be answered
+    // by one log search instead of knowing every job's own prefix.
+    if (attemptsMade >= MAX_ATTEMPTS) {
+      console.warn(
+        `[ALERT][retry] order ${orderId}: giving up after ${attemptsMade} attempts — ${out.reason} ` +
+          `(needs a manual fix, e.g. node src/scripts/order-fix.js --order ${orderId})`
+      );
+
+      // Send failure notification when giving up on an order
+      try {
+        const order = (await getOrder(orderId))?.order;
+        if (order) {
+          await notifyOrderStatus(order, { force: true });
+        }
+      } catch (err) {
+        console.warn(`[retry] order ${orderId}: could not send failure notification — ${err.message.split('\n')[0]}`);
+      }
+    } else {
+      console.warn(`[retry] order ${orderId}: still failing (attempt ${attemptsMade}/${MAX_ATTEMPTS}) — ${out.reason}`);
+    }
+    return false;
+  }
+
+  // It worked. Hand the row back to the enrichment queue so the derived data is
+  // rebuilt from the corrected attributes.
+  await pool.query(
+    `UPDATE orders_to_enrich
+        SET status = 'pending', attempts = 0, error_message = NULL,
+            hds_write_ok = TRUE, updated_at = NOW()
+      WHERE order_id = $1`,
+    [orderId]
+  );
+
+  const pack = out.wrote?.['Pick-Pack-Date'];
+  const writeStatus = skipShopifyWrite ? '(dry-run, no Shopify write)' : '(wrote to Shopify)';
+  console.log(
+    `[retry] order ${orderId}: ${out.action} ${writeStatus}` +
+      (pack ? `, pack ${pack}` : '') +
+      (out.tagsAdded.length ? `, tags ${out.tagsAdded.join(', ')}` : '')
+  );
+  return true;
+}
+
+async function tick() {
+  if (running) return;
+  running = true;
+  try {
+    const { rows } = await pool.query(SELECT_PENDING, [MAX_ATTEMPTS, BATCH]);
+    if (!rows.length) return;
+
+    console.log(`[retry] ${rows.length} order(s) to re-attempt`);
+    for (const row of rows) {
+      try {
+        await retryOne(row);
+      } catch (err) {
+        const reason = (err.message || String(err)).split('\n')[0];
+        await pool
+          .query(
+            `UPDATE orders_to_enrich
+                SET attempts = attempts + 1, error_message = $2, updated_at = NOW()
+              WHERE order_id = $1`,
+            [row.order_id, `retry: ${reason}`]
+          )
+          .catch(() => {});
+        console.warn(`[retry] order ${row.order_id}: ${reason}`);
+
+        // A credentials or scope problem fails identically for every row, so stop
+        // rather than burn the whole batch discovering that.
+        if (/failed 40[13]|not set|no Admin API token/i.test(err.message || '')) {
+          console.error('[retry] stopping this pass: the Admin API is not usable');
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[retry] pass failed:', err.message || err);
+  } finally {
+    running = false;
+  }
+}
+
+function initHdsRetry() {
+  if (String(process.env.HDS_RETRY_ENABLED || 'true').toLowerCase() === 'false') {
+    console.log('[retry] disabled (HDS_RETRY_ENABLED=false)');
+    return;
+  }
+  if (!process.env.DATABASE_URL) {
+    console.log('[retry] disabled: no DATABASE_URL, so there is no record of what to retry');
+    return;
+  }
+
+  console.log(
+    `[retry] started (every ${INTERVAL_MS < 60000 ? Math.round(INTERVAL_MS / 1000) + 's' : Math.round(INTERVAL_MS / 60000) + 'm'}, ` +
+      `batch ${BATCH}, up to ${MAX_ATTEMPTS} attempts)`
+  );
+  setInterval(tick, INTERVAL_MS);
+}
+
+module.exports = { initHdsRetry, tick };

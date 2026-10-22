@@ -1,0 +1,39 @@
+{
+  "name": "iku-hds-order-loop-enrichment",
+  "version": "1.0.0",
+  "private": true,
+  "description": "IKU standalone service: receives Shopify orders/create webhooks and enriches orders with HDS delivery data (pack/production dates, region, suburb) in a background queue.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "migrate": "node src/migrate.js",
+    "loop:check": "node src/scripts/loop-check.js",
+    "loop:update": "node src/scripts/loop-update.js",
+    "orders:recent": "node src/scripts/orders-recent.js",
+    "order:fix": "node src/scripts/order-fix.js",
+    "order:explain": "node src/scripts/order-explain.js",
+    "shopify:check": "node src/scripts/shopify-check.js",
+    "shopify:webhooks": "node src/scripts/shopify-webhooks.js",
+    "packdate:manual": "node src/scripts/packdate-manual.js",
+    "packdates:backfill": "node src/scripts/packdates-backfill.js",
+    "packdates:sweep": "node src/scripts/packdates-sweep.js",
+    "schedules:stuck": "node src/scripts/stuck-schedules.js",
+    "alerts:digest": "node src/scripts/alert-digest-now.js",
+    "order:notify": "node src/scripts/order-notify-now.js",
+    "order:audit": "node src/scripts/order-audit.js",
+    "labels:rename": "node src/scripts/labels-rename.js",
+    "reorder:check": "node src/scripts/reorder-check.js",
+    "packdate:bulk": "node src/scripts/bulk-packdate-update.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nodemailer": "^10.0.3",
+    "pg": "^8.12.0"
+  }
+}

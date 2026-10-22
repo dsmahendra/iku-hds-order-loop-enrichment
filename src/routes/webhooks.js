@@ -1,0 +1,728 @@
+const express = require('express');
+const { pool } = require('../db');
+const {
+  verifyWebhook,
+  webhookDigest,
+  getNoteAttribute,
+  getHdsAttributes,
+  normalizeDate,
+} = require('../shopify');
+const {
+  editChargeOffsetRetrying,
+  subscriptionIdForOrderRetrying,
+  subscriptionContextForOrder,
+} = require('../loop');
+const {
+  needsRewrite,
+  rewriteRenewalOrder,
+  cutoffFor,
+  HELD_TAG,
+  hasHdsRecords,
+  fillHdsRecords,
+  pendingHdsFields,
+  DEFAULT_DELIVERY_TIME,
+  selectionMode,
+} = require('../lib/renewal-rewrite');
+const { missingTags, taggingEnabled, hasSellingPlan } = require('../lib/order-tags');
+const { buildHdsAttributes } = require('../lib/renewal-date');
+const { legacyLabelUpdates, describeUpdates, isEnabled: renameEnabled } = require('../lib/legacy-labels');
+const { notifyOrderStatus, isEnabled: perOrderEmailEnabled } = require('../lib/order-notify');
+const audit = require('../lib/order-audit');
+const { updateOrderAttributes, getOrder } = require('../shopify');
+const { sendMail, isConfigured: emailConfigured } = require('../lib/mailer');
+
+// Recompute stale renewal dates and write them back onto the order — the job
+// Arigato Automation was doing. Set REWRITE_RENEWAL_DATES=false to stand this
+// down without a deploy (e.g. while Arigato is still live, so the two don't both
+// write to the same order).
+const REWRITE_RENEWALS =
+  String(process.env.REWRITE_RENEWAL_DATES || 'true').toLowerCase() !== 'false';
+
+// Orders scheduled by another app (Zapiet on production) arrive with a valid
+// future Delivery-Date and no HDS fields at all, so the rewrite rightly leaves
+// them alone — and nothing was giving the kitchen a pack or production date for
+// them. This fills those in AROUND the existing delivery date.
+const FILL_HDS = String(process.env.FILL_HDS_RECORDS || 'true').toLowerCase() !== 'false';
+
+// Some errors (a bad DATABASE_URL among them) arrive with an empty message, which
+// logs as "failed to queue order: " and says nothing. Fall back to whatever the
+// error does carry.
+function describeError(err) {
+  if (!err) return 'unknown error';
+  return err.message || err.code || err.name || String(err);
+}
+
+const router = express.Router();
+
+// Shopify "Order creation" webhook.
+// IMPORTANT: mounted with a RAW body parser (see index.js) so HMAC can be
+// verified against the exact bytes Shopify sent.
+router.post('/shopify/orders/create', async (req, res) => {
+  const rawBody = req.body; // Buffer, from express.raw
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+
+  if (!verifyWebhook(rawBody, hmac)) {
+    // A bare "verification failed" can't distinguish a missing secret from a
+    // wrong one, and that was costing whole debugging cycles. Digest prefixes
+    // are safe to log — the secret itself never appears.
+    const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
+    const expected = webhookDigest(rawBody);
+    console.warn(
+      '[webhook] HMAC verification failed — ' +
+        `SHOPIFY_WEBHOOK_SECRET ${secret ? `set (${secret.length} chars)` : 'MISSING'}, ` +
+        `X-Shopify-Hmac-Sha256 ${hmac ? 'present' : 'MISSING'}, ` +
+        `body ${rawBody?.length ?? 0} bytes` +
+        (expected && hmac
+          ? `, computed ${expected.slice(0, 10)}… vs received ${String(hmac).slice(0, 10)}…` +
+            ' (different ⇒ wrong secret: use the value Shopify shows on the webhook page,' +
+            ' or the app API secret key if the webhook was created by a custom app)'
+          : '')
+    );
+    return res.status(401).send('invalid hmac');
+  }
+
+  // Acknowledge fast; do the work in the background queue.
+  res.status(200).send('ok');
+
+  let order;
+  try {
+    order = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    console.warn('[webhook] could not parse body');
+    return;
+  }
+
+  const orderId = order?.id;
+  if (!orderId) {
+    console.warn('[webhook] payload had no order id');
+    return;
+  }
+
+  // Accept the labelled keys the checkout extension writes ("HDS Delivery Date"),
+  // the legacy snake_case, and the Delivery-* contract keys. Dates arrive as
+  // yyyy/mm/dd, so normalise to ISO for the DATE column and API matching.
+  const rawDeliveryDate = firstAttribute(order, [
+    'HDS Delivery Date',
+    'hds_delivery_date',
+    'Delivery-Date',
+  ]);
+  const deliveryDate = rawDeliveryDate ? normalizeDate(rawDeliveryDate) : null;
+
+  const source = isLoopOrder(order) ? 'loop' : 'checkout';
+
+  // Audit trail: the order exactly as it arrived, before anything of ours touches
+  // it, and every write below is attributed to the webhook.
+  audit.setSource('webhook');
+  audit.recordCheckout(order, { order_source: source });
+
+  const postcode =
+    firstAttribute(order, ['HDS Postcode', 'hds_postcode', 'Delivery-Location-Id']) ||
+    order?.shipping_address?.zip ||
+    null;
+  const suburb =
+    firstAttribute(order, ['HDS Suburb', 'hds_suburb']) ||
+    order?.shipping_address?.city ||
+    null;
+  const deliveryTime = firstAttribute(order, [
+    'HDS Delivery Window',
+    'hds_delivery_window',
+    'Delivery-Time',
+  ]);
+
+  // The checkout extension writes the HDS cutoff-days value as "Charge Offset"
+  // (e.g. "3 Days"). We push this to Loop as the subscription's chargeOffset.
+  let chargeOffset = parseChargeOffset(order);
+
+  // What the rest of the handler works from. A Loop renewal's attributes are a
+  // verbatim copy of the subscription's — i.e. the FIRST cycle's dates — so these
+  // may be replaced below.
+  let effectiveDeliveryDate = deliveryDate;
+  let effectiveWindow = deliveryTime;
+  let effectiveSuburb = suburb;
+  let effectivePostcode = postcode;
+  let effectiveAttributes = getHdsAttributes(order);
+
+  // Done BEFORE the INSERT deliberately: the stale attribute set is COMPLETE, so
+  // enrichFromAttributes() would accept it as authoritative, skip the HDS API and
+  // write the wrong pack/production dates into order_enrichments. The queue must
+  // never see it.
+  // Triggered by STALENESS, not by whether we recognised the order as a Loop
+  // renewal. A delivery date earlier than the order date is impossible for a
+  // checkout order — nobody picks a delivery before they order — so the condition
+  // alone is proof enough. It also means this works when LOOP_SHOPIFY_APP_ID is
+  // unset and the order carries no tags to sniff, which is exactly the case on
+  // the renewals seen so far.
+  let rewritten = false;
+  let rewriteFailed = false;
+  let filled = false;
+
+  // Did this order end up with the HDS data it needs?
+  //
+  // The gap this closes: a write that failed here left the row as 'pending',
+  // the enrichment worker moved it to 'processed', and the retry job only ever
+  // looked at 'skipped' and 'failed'. So an order whose pack date never landed
+  // was indistinguishable from one that succeeded, and nothing tried again. It
+  // stayed wrong until somebody noticed and ran a backfill by hand.
+  //
+  // Recorded separately from status because the two pipelines are separate:
+  // status tracks OUR enrichment tables, this tracks the write onto the
+  // Shopify order.
+  let hdsWriteOk = true;
+  let loopSubscriptionIdEarly = null;
+  let subscriptionContext = null;
+  // Recorded so a questioned date can be explained later: what the order arrived
+  // with, and what the resolver locked onto.
+  let previousDeliveryDate = null;
+  let rewriteMatchedBy = null;
+  let rewriteScheduleSource = null;
+
+  // REWRITE_RENEWAL_DATES=false means "do not REPLACE a date another system owns".
+  // It should never have meant "do not add one to an order that has none" — an
+  // order with no delivery date at all has nothing to protect, and refusing left it
+  // with no pack date either, which is the opposite of the intent.
+  const initialState = needsRewrite(order);
+  const noDeliveryDate =
+    !getNoteAttribute(order, 'Delivery-Date') && !getNoteAttribute(order, 'HDS Delivery Date');
+  const mayWriteDates = REWRITE_RENEWALS || noDeliveryDate;
+
+  if (mayWriteDates) {
+    const state = initialState;
+    if (!state.stale) {
+      if (source === 'loop') {
+        console.log(`[webhook] order ${orderId}: ${state.reason} — no date rewrite needed`);
+      }
+    } else {
+      console.log(
+        `[webhook] order ${orderId}: ${state.reason} — recomputing from the order date` +
+          (!REWRITE_RENEWALS ? ' (allowed with rewriting stood down: nothing is being replaced)' : '')
+      );
+      previousDeliveryDate = state.current || null;
+
+      // Best effort: the subscription's own Delivery-Date is the authoritative
+      // weekday, but only 'keep-weekday' mode actually needs it — 'cutoff-day'
+      // (the default) and 'earliest' match the schedule off the ORDER's own
+      // creation weekday instead, so this Loop round trip bought nothing there
+      // except latency before the write, and Loop may not have ingested the
+      // order yet regardless. Skipped unless the mode requires it: the tags
+      // block further down still fetches the subscription once it actually
+      // wants it, AFTER Pick-Pack-Date/Delivery-Time have already landed on the
+      // order — which matters because at least one downstream integration
+      // (NetSuite) reads the order exactly once, at creation, and never
+      // revisits it, so whatever isn't on the order by then is missed for good.
+      let subscriptionAttributes = null;
+      if (selectionMode() === 'keep-weekday') {
+        try {
+          const context = await subscriptionContextForOrder(orderId);
+          subscriptionContext = context;
+          subscriptionAttributes = context?.attributes || null;
+          if (context) loopSubscriptionIdEarly = context.subscriptionId;
+        } catch (err) {
+          console.warn(
+            `[webhook] order ${orderId}: could not read the subscription for its delivery day — ${describeError(err)}`
+          );
+        }
+      }
+      try {
+        const out = await rewriteRenewalOrder(order, { subscriptionAttributes });
+        if (!out.ok) {
+          rewriteFailed = true;
+          hdsWriteOk = false;
+          console.warn(
+            `[webhook] order ${orderId}: date rewrite skipped — ${out.reason}` +
+              (out.schedule ? ` (schedule from ${out.schedule.derivedFrom})` : '')
+          );
+        } else {
+          const r = out.resolved;
+          const window = out.attributes['HDS Delivery Window'] || null;
+          effectiveDeliveryDate = r.delivery_date;
+          effectiveWindow = window || effectiveWindow;
+          effectiveSuburb = r.suburb || effectiveSuburb;
+          effectivePostcode = r.postcode || effectivePostcode;
+          effectiveAttributes = buildHdsAttributes(r, window);
+
+          // Push the offset for the REWRITTEN date, not the checkout's leftover
+          // value: it's region-specific (3 days in NSW, 4 in VIC).
+          const derivedOffset = cutoffFor(r.option).charge_offset_days;
+          if (derivedOffset != null) chargeOffset = derivedOffset;
+          rewritten = true;
+          rewriteMatchedBy = r.matched_by || null;
+          rewriteScheduleSource = out.schedule
+            ? `${out.schedule.deliveryDay || '?'} via ${out.schedule.derivedFrom}` +
+              (out.schedule.scheduleId ? ` (schedule ${out.schedule.scheduleId})` : '')
+            : null;
+
+          console.log(
+            `[webhook] order ${orderId}: dates rewritten — delivery ${r.delivery_date}, ` +
+              `pack ${r.pack_date}, production ${r.production_date} ` +
+              `[matched ${r.matched_by}; weekday from ${rewriteScheduleSource}]` +
+              (out.tag ? `, tag ${out.tag}` : '')
+          );
+        }
+      } catch (err) {
+        rewriteFailed = true;
+        hdsWriteOk = false;
+        console.error(`[webhook] order ${orderId}: date rewrite failed — ${describeError(err)}`);
+      }
+    }
+  }
+
+  // Independent of REWRITE_RENEWAL_DATES on purpose.
+  //
+  // While another app still owns this store's delivery dates, rewriting is stood
+  // down — but an order whose date is fine and simply has NO HDS fields still needs
+  // them, and adding those changes no date. Nesting this inside the rewrite switch
+  // meant standing one down stood down the other, which is the opposite of what a
+  // staged cutover needs.
+  //
+  // Never fills around a STALE date: deriving a pack date from an expired delivery
+  // date would hand the kitchen something already in the past.
+  const pending = FILL_HDS ? pendingHdsFields(order) : [];
+  if (pending.length && !rewritten && !rewriteFailed) {
+    const state = needsRewrite(order);
+    if (state.stale) {
+      // Missing fields we chose not to derive are still missing fields. Flagged so
+      // the retry job comes back to it: the delivery date may be rewritten later,
+      // or REWRITE_RENEWAL_DATES turned on, and then these can be computed.
+      hdsWriteOk = false;
+      // Two different situations, and conflating them hid a real one: an order with
+      // an EXPIRED date cannot be derived from, but an order with NO date needs the
+      // rewrite to compute one — and if rewriting is stood down, nothing will.
+      const noDate = !getNoteAttribute(order, 'Delivery-Date') && !getNoteAttribute(order, 'HDS Delivery Date');
+      console.log(
+        `[webhook] order ${orderId}: ${pending.length} HDS field(s) missing but ` +
+          (noDate
+            ? 'the order has NO delivery date — set REWRITE_RENEWAL_DATES=true so one can be computed'
+            : `its delivery date is expired (${state.current}) — not deriving from it`)
+      );
+    } else {
+      console.log(
+        `[webhook] order ${orderId}: missing ${pending.length} HDS field(s) — ${pending.join(', ')}`
+      );
+      try {
+        // Named 'out' because 'filled' shadowed an outer flag of that name, so
+        // the assignment to it below hit a const and threw. Every successful fill
+        // logged "filling HDS records failed — Assignment to constant variable"
+        // and never logged the dates it had in fact just written, which made a
+        // working path look broken for weeks.
+        const out = await fillHdsRecords(order);
+        if (!out.ok) {
+          hdsWriteOk = false;
+          console.warn(`[webhook] order ${orderId}: could not fill HDS records — ${out.reason}`);
+        } else {
+          filled = true;
+          const r = out.resolved;
+          effectiveDeliveryDate = r.delivery_date;
+          effectiveSuburb = r.suburb || effectiveSuburb;
+          effectivePostcode = r.postcode || effectivePostcode;
+          effectiveAttributes = buildHdsAttributes(r, out.attributes['HDS Delivery Window']);
+          rewriteMatchedBy = r.matched_by || null;
+          rewriteScheduleSource = out.locationUsed
+            ? `${out.locationUsed.suburb} ${out.locationUsed.postcode} via ${out.locationUsed.source}`
+            : null;
+          console.log(
+            `[webhook] order ${orderId}: HDS records added — delivery ${r.delivery_date} kept, ` +
+              `ship ${r.pack_date}, production ${r.production_date} [${r.matched_by}]` +
+              (out.tag ? `, tag ${out.tag}` : '')
+          );
+        }
+      } catch (err) {
+        hdsWriteOk = false;
+        console.error(`[webhook] order ${orderId}: filling HDS records failed — ${describeError(err)}`);
+      }
+    }
+  }
+
+  // Everything below is an ADDITIVE decision (tags to add, an attribute to
+  // default, a label to rename) computed purely from the `order` payload
+  // already in hand — none of them depends on another's result. They used to
+  // fire as up to four separate Shopify PUTs per order, each waiting its turn
+  // on the single global rate-limited queue in shopify.js. That's cheap for
+  // one order and expensive for twenty landing in the same minute (a Loop
+  // renewal batch), where it was the difference between the write happening
+  // in-window and it still being queued behind everyone else's calls when the
+  // next burst arrived. Collected here and sent as ONE PUT instead.
+  let tailAttributes = {};
+  let tailRemoveAttributes = [];
+  let tailAddTags = [];
+  const tailNotes = [];
+
+  // An order that arrived already complete — a normal checkout order, where the
+  // extension has written the whole HDS set — triggers neither the rewrite nor the
+  // fill, and so was getting no tags at all. Arigato and Zapiet used to tag those
+  // and nothing replaced them. No HDS call needed: the dates are already on the
+  // order, so the tags come straight off them.
+  if (taggingEnabled()) {
+    // Loop supplies the subscription tags. Fetched only when the order looks like a
+    // subscription and we have not already read it, and a failure here costs only
+    // those tags — the date ones come off the order itself.
+    let tagContext = subscriptionContext;
+    // hasSellingPlan catches the FIRST order on a subscription, which Loop has not
+    // tagged yet when this fires — that order was getting only its date tags.
+    if (!tagContext && (source === 'loop' || hasSellingPlan(order) || loopSubscriptionIdEarly)) {
+      try {
+        tagContext = await subscriptionContextForOrder(orderId);
+      } catch (err) {
+        console.warn(
+          `[webhook] order ${orderId}: no subscription tags — ${describeError(err)}`
+        );
+      }
+    }
+
+    // atCreation: the webhook runs the moment the order exists, so the cycle count
+    // still describes this order.
+    // firstEnrichmentOnly: skip pack date tag on re-enrichment attempts to avoid updates
+    const missing = missingTags(order, tagContext, { atCreation: true, firstEnrichmentOnly: true });
+    if (missing.length) {
+      tailAddTags.push(...missing);
+      const packDateTag = missing.find((t) => t.startsWith('Pick-Pack-Date'));
+      const otherTags = missing.filter((t) => !t.startsWith('Pick-Pack-Date'));
+
+      if (packDateTag) {
+        console.log(`[webhook] order ${orderId}: pack date tag — adding ${packDateTag} (first enrichment)`);
+      }
+      if (otherTags.length) {
+        console.log(`[webhook] order ${orderId}: other tags — adding ${otherTags.join(', ')}`);
+      }
+      tailNotes.push(`tags added — ${missing.join(', ')}`);
+    } else {
+      // Check if pack date tag was skipped due to re-enrichment
+      const existingTags = String(order?.tags || '').toLowerCase();
+      if (existingTags.includes('pick-pack-date')) {
+        console.log(`[webhook] order ${orderId}: pack date tag — skipped (re-enrichment attempt, tag already exists)`);
+      }
+    }
+  }
+
+  // Delivery-Time is deliberately excluded from the HDS field set (it belongs to
+  // checkout/whatever scheduled the order), so an order whose dates were already
+  // complete never gets one from the rewrite or fill above. A rewritten or filled
+  // order already carries it — buildOrderAttributes resolves it as part of that
+  // write — so only the untouched case needs it added directly. No HDS call
+  // needed: the default is a fixed clock range, not something derived from the
+  // schedule.
+  if (!rewritten && !filled && !getNoteAttribute(order, 'Delivery-Time')) {
+    tailAttributes['Delivery-Time'] = DEFAULT_DELIVERY_TIME;
+    tailNotes.push(`Delivery-Time defaulted to ${DEFAULT_DELIVERY_TIME}`);
+  }
+
+  // The order still shows the expired dates, and nothing on the order page says so.
+  // Tag it, so ops and fulfilment can see the dates are not to be trusted instead of
+  // reading a plausible-looking date that has already passed.
+  if (rewriteFailed) {
+    tailAddTags.push(HELD_TAG);
+    tailNotes.push(`tagged ${HELD_TAG} — dates left as they arrived, needs a manual fix`);
+  }
+
+  // A rewritten order already carries the new labels: the rewrite replaces that
+  // whole set and strips the old keys. Everything else — first-time checkout orders
+  // above all — needs the rename on its own, with the VALUE untouched, since the
+  // date a customer chose at checkout is correct and only its label moved.
+  if (!rewritten && renameEnabled()) {
+    const updates = legacyLabelUpdates(order);
+    if (updates) {
+      Object.assign(tailAttributes, updates.attributes);
+      tailRemoveAttributes.push(...updates.remove);
+      tailNotes.push(`labels renamed — ${describeUpdates(updates)}`);
+    }
+  }
+
+  // Include the rewritten/filled HDS attributes if the rewrite or fill succeeded.
+  // These were computed above but only stored in the database — they must also be
+  // written to Shopify on the FIRST pass, not deferred to the queue processor, to
+  // avoid a second run re-processing and potentially deleting them.
+  const allAttributes = { ...tailAttributes };
+  if ((rewritten || filled) && effectiveAttributes) {
+    Object.assign(allAttributes, effectiveAttributes);
+  }
+
+  if (tailAddTags.length || tailRemoveAttributes.length || Object.keys(allAttributes).length) {
+    try {
+      await updateOrderAttributes(orderId, {
+        attributes: allAttributes,
+        addTags: tailAddTags,
+        removeAttributes: tailRemoveAttributes,
+        order,
+      });
+      for (const note of tailNotes) console.log(`[webhook] order ${orderId}: ${note}`);
+      if (rewriteFailed) {
+        // One searchable tag across every job (this one, the retry job, the
+        // sweep) is what lets "is anything broken right now" be answered by a
+        // single log search instead of knowing each job's own prefix.
+        console.warn(
+          `[ALERT][webhook] order ${orderId}: tagged ${HELD_TAG} — dates left as they arrived, needs a manual fix ` +
+            `(node src/scripts/order-fix.js --order ${orderId})`
+        );
+      }
+    } catch (err) {
+      hdsWriteOk = false;
+      console.warn(
+        `[webhook] order ${orderId}: could not apply (${tailNotes.join('; ') || 'pending updates'}) — ${describeError(err)}`
+      );
+      if (rewriteFailed) {
+        console.warn(
+          `[ALERT][webhook] order ${orderId}: could not tag ${HELD_TAG} either — dates left as they arrived, ` +
+            `needs a manual fix (node src/scripts/order-fix.js --order ${orderId})`
+        );
+      }
+    }
+  }
+
+  // No Delivery-Date means nothing to enrich — a Loop renewal whose subscription
+  // attributes weren't written in time, or a non-delivery order. Record it as
+  // 'skipped' rather than dropping it silently, so the gap is visible and the
+  // row can be requeued once a date is known.
+  // A failed rewrite must NOT be enriched from the stale attributes: that set is
+  // complete, so enrichFromAttributes would accept it as authoritative and write
+  // dates that already expired into order_enrichments. Hold it instead, visibly,
+  // for order:fix to redo once the cause is cleared.
+  const status = rewriteFailed || !effectiveDeliveryDate ? 'skipped' : 'pending';
+  const errorMessage = rewriteFailed
+    ? 'stale renewal dates could not be recomputed — held rather than enriched from expired attributes (retry with order:fix)'
+    : effectiveDeliveryDate
+      ? null
+      : source === 'loop'
+        ? 'Loop renewal arrived without Delivery-Date (subscription attribute not set before charge)'
+        : 'order has no Delivery-Date';
+
+  // Queue the order BEFORE touching Loop. The subscription lookup below waits on
+  // Loop's ingest lag (up to ~18s), and a restart inside that window must not
+  // lose the order. subscription_id is nullable and backfilled once resolved.
+  try {
+    await pool.query(
+      `INSERT INTO orders_to_enrich
+         (order_id, delivery_date, delivery_location_id, delivery_time, suburb,
+          status, error_message, source, source_attributes,
+          previous_delivery_date, rewrite_matched_by, rewrite_schedule_source,
+          hds_write_ok)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       ON CONFLICT (order_id) DO NOTHING`,
+      [
+        orderId,
+        effectiveDeliveryDate,
+        effectivePostcode,
+        effectiveWindow,
+        effectiveSuburb,
+        status,
+        errorMessage,
+        source,
+        // Same reason: withhold the expired set rather than let it look authoritative.
+        rewriteFailed ? null : effectiveAttributes,
+        previousDeliveryDate,
+        rewriteMatchedBy,
+        rewriteScheduleSource,
+        hdsWriteOk,
+      ]
+    );
+
+    if (!hdsWriteOk) {
+      console.warn(
+        `[webhook] order ${orderId}: HDS data incomplete — flagged for the retry job`
+      );
+      audit.record({
+        order,
+        stage: 'backend_failed',
+        source: 'webhook',
+        detail: { reason: errorMessage || 'HDS data incomplete', note: 'webhook could not complete the HDS data' },
+      });
+      // Send email alert for failed/incomplete orders
+      try {
+        const reason = errorMessage || 'Unknown reason';
+        const config = require('../lib/mailer').config();
+
+        // Build recipient list: primary alerts + admin failures list
+        const recipients = new Set(config.to || []);
+        const failureAdmins = String(process.env.FAILURE_EMAIL_ADMINS || '')
+          .split(',')
+          .map(e => e.trim())
+          .filter(Boolean);
+        failureAdmins.forEach(e => recipients.add(e));
+
+        if (recipients.size === 0) {
+          console.warn(
+            `[webhook] order ${orderId}: failure email NOT sent — ` +
+            `set ALERT_EMAIL_TO or FAILURE_EMAIL_ADMINS to enable failure notifications`
+          );
+        } else {
+          const emailResult = await sendMail({
+            subject: `[HDS] Order ${order.name || orderId} — enrichment FAILED`,
+            text: `⚠️ ORDER ENRICHMENT FAILED
+
+Order: ${order.name || orderId} (ID: ${orderId})
+Created: ${order.created_at}
+Status: ${status}
+Source: ${source}
+
+Reason:
+${reason}
+
+Fix it with:
+  node src/scripts/order-fix.js --name ${order.name || orderId}
+
+Store: ${process.env.SHOPIFY_STORE || 'unknown'}`,
+            to: Array.from(recipients)
+          });
+          if (emailResult.sent) {
+            console.log(
+              `[webhook] order ${orderId}: failure email sent to ${emailResult.to.join(', ')}` +
+                (emailResult.bcc?.length ? ` (bcc ${emailResult.bcc.join(', ')})` : '')
+            );
+          } else {
+            console.warn(
+              `[webhook] order ${orderId}: failure email NOT sent — ${emailResult.reason}`
+            );
+          }
+        }
+      } catch (emailErr) {
+        console.warn(
+          `[webhook] order ${orderId}: failure email send failed — ${describeError(emailErr)}`
+        );
+      }
+    }
+
+    if (status === 'pending') {
+      console.log(`[webhook] queued order ${orderId} (${source}) for enrichment`);
+    } else {
+      console.log(`[webhook] order ${orderId} (${source}) has no Delivery-Date — recorded as skipped`);
+    }
+  } catch (err) {
+    console.error(`[webhook] failed to queue order ${orderId}:`, describeError(err));
+  }
+
+  // Resolve the subscription via Loop's order lookup (returns the
+  // "shopify-{contractId}" id the Loop API expects). Worth doing whenever the
+  // order looks subscription-related OR carries a charge offset to push.
+  // loopSubscriptionId → Loop API calls; subscriptionId → our BIGINT column.
+  let loopSubscriptionId = loopSubscriptionIdEarly;
+  if (!loopSubscriptionId && (effectiveDeliveryDate || source === 'loop' || chargeOffset != null)) {
+    try {
+      loopSubscriptionId = await subscriptionIdForOrderRetrying(orderId, {
+        onRetry: (attempt, wait, err) =>
+          console.warn(
+            `[webhook] order ${orderId}: Loop lookup attempt ${attempt} failed (${describeError(err)}) — retrying in ${wait}ms`
+          ),
+      });
+    } catch (err) {
+      console.warn(`[webhook] Loop subscription lookup failed for order ${orderId}:`, describeError(err));
+    }
+  } else if (loopSubscriptionId) {
+    console.log(`[webhook] order ${orderId}: subscription ${loopSubscriptionId} already resolved — no second lookup`);
+  } else {
+    console.log(
+      `[webhook] order ${orderId}: no Delivery-Date, not a Loop order and no Charge Offset — skipping Loop lookup`
+    );
+  }
+
+  const subscriptionId = loopSubscriptionId
+    ? loopSubscriptionId.replace(/^shopify-/, '')
+    : null;
+
+  if (subscriptionId) {
+    try {
+      await pool.query(
+        `UPDATE orders_to_enrich SET subscription_id = $2, updated_at = NOW()
+          WHERE order_id = $1 AND subscription_id IS NULL`,
+        [orderId, subscriptionId]
+      );
+    } catch (err) {
+      console.warn(`[webhook] could not store subscription id for order ${orderId}:`, describeError(err));
+    }
+  }
+
+  // Push the charge offset (HDS cutoff days) onto the Loop subscription so future
+  // renewals are charged at the HDS cutoff. Every branch logs, so a silent
+  // no-op is never mistaken for a successful write.
+  if (loopSubscriptionId && chargeOffset != null) {
+    try {
+      const res = await editChargeOffsetRetrying(loopSubscriptionId, chargeOffset, {
+        onRetry: (attempt, wait, err) =>
+          console.warn(
+            `[webhook] order ${orderId}: chargeOffset attempt ${attempt} failed (${describeError(err)}) — retrying in ${wait}ms`
+          ),
+      });
+      console.log(
+        `[webhook] Loop chargeOffset=${chargeOffset} set on ${loopSubscriptionId} (order ${orderId}) — response:`,
+        JSON.stringify(res)
+      );
+    } catch (err) {
+      console.warn(
+        `[webhook] failed to set Loop chargeOffset for ${loopSubscriptionId}:`,
+        describeError(err)
+      );
+    }
+  } else if (chargeOffset == null) {
+    console.log(
+      `[webhook] order ${orderId} carries no "Charge Offset" note attribute — nothing to push to Loop`
+    );
+  } else {
+    console.log(
+      `[webhook] order ${orderId} has chargeOffset=${chargeOffset} but no subscription — skipping Loop update`
+    );
+  }
+
+  // A Loop renewal that DID carry a date closes the loop on our pre-charge write.
+  if (source === 'loop' && subscriptionId && effectiveDeliveryDate) {
+    try {
+      await pool.query(
+        `UPDATE loop_subscription_deliveries
+            SET shopify_order_id = $2, updated_at = NOW()
+          WHERE subscription_id = $1 AND delivery_date = $3`,
+        [subscriptionId, orderId, effectiveDeliveryDate]
+      );
+    } catch (err) {
+      console.warn(`[webhook] could not link order ${orderId} to subscription:`, describeError(err));
+    }
+  }
+
+  // Real-time per-order status email — opt-in (PER_ORDER_EMAIL_ENABLED),
+  // additive to the periodic digest. Checked before the extra GET below so a
+  // store that hasn't turned this on pays nothing for it. Fetches the order
+  // fresh rather than classifying the original webhook payload, since
+  // everything above (rewrite/fill/tags) has written to the order by now and
+  // this local `order` variable was never updated to reflect it.
+  if (source === 'loop' && perOrderEmailEnabled()) {
+    try {
+      const fresh = (await getOrder(orderId))?.order || order;
+      await notifyOrderStatus(fresh);
+    } catch (err) {
+      console.warn(`[webhook] order ${orderId}: per-order email failed — ${describeError(err)}`);
+    }
+  }
+});
+
+// The checkout extension writes hds_* note attributes (visible as "Additional
+// details" on the order). Older orders may carry the Delivery-* spelling, so
+// accept either and take the first that's present.
+function firstAttribute(order, names) {
+  for (const name of names) {
+    const value = getNoteAttribute(order, name);
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return null;
+}
+
+// The extension writes "Charge Offset" as "3 Days"; older orders may use
+// "HDS Cutoff Days" / "hds_cutoff_days". Extract the leading integer (→ 3).
+function parseChargeOffset(order) {
+  const raw = firstAttribute(order, [
+    'Charge Offset',
+    'HDS Cutoff Days',
+    'hds_cutoff_days',
+  ]);
+  if (raw == null) return null;
+  const match = String(raw).match(/\d+/);
+  return match ? Number(match[0]) : null;
+}
+
+// Shopify stamps app_id with the app that created the order, so Loop renewals
+// are identifiable even when they carry no delivery attributes. Set
+// LOOP_SHOPIFY_APP_ID to Loop's app id (read it off a known renewal order).
+function isLoopOrder(order) {
+  const configured = process.env.LOOP_SHOPIFY_APP_ID;
+  if (configured && String(order?.app_id) === String(configured)) return true;
+
+  // Fallback while the app id is unconfirmed: Shopify tags subscription orders.
+  const tags = String(order?.tags || '').toLowerCase();
+  return tags.includes('subscription') || tags.includes('loop');
+}
+
+module.exports = router;
